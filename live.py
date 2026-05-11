@@ -31,8 +31,8 @@ from data import fetch_ohlcv
 from strategy import compute_indicators, get_signal, should_exit
 
 # ── config ─────────────────────────────────────────────────────────────
-BINANCE_SYMBOL = "SOL/USDT"   # data source (Binance via ccxt)
-ALPACA_SYMBOL  = "SOL/USD"    # execution (Alpaca)
+SYMBOL        = "SOL/USD"    # used for both data and execution (Alpaca)
+ALPACA_SYMBOL = "SOL/USD"
 TIMEFRAME      = "5m"
 CANDLE_MINUTES = 5
 ORDER_SIZE_USD = 10.0          # notional dollars per trade
@@ -134,7 +134,7 @@ def run():
         print(f"[RESUME] Alpaca shows open position but no local state — entry metadata unavailable.")
 
     account = trading_client.get_account()
-    print(f"[INFO]  Strategy : Bollinger Band Fade  |  {BINANCE_SYMBOL}  |  {TIMEFRAME}")
+    print(f"[INFO]  Strategy : Bollinger Band Fade  |  {SYMBOL}  |  {TIMEFRAME}")
     print(f"[INFO]  Alpaca paper account — buying power: ${float(account.buying_power):,.2f}")
     print(f"[INFO]  Order size: ${ORDER_SIZE_USD} notional per trade")
     print(f"[INFO]  Trades logged to {TRADES_FILE}")
@@ -157,7 +157,7 @@ def run():
 
         # ── fetch + compute ────────────────────────────────────────────
         try:
-            df = fetch_ohlcv(BINANCE_SYMBOL, TIMEFRAME, days=1)
+            df = fetch_ohlcv(SYMBOL, TIMEFRAME, days=1)
             df = compute_indicators(df)
         except Exception as e:
             print(f"[{now_str()}] ERROR fetching data: {e} — skipping tick")
@@ -193,7 +193,7 @@ def run():
 
                     trade = {
                         "timestamp": state["entry_time"],
-                        "ticker": BINANCE_SYMBOL,
+                        "ticker": SYMBOL,
                         "side": "long",
                         "entry_price": round(entry_price, 4),
                         "exit_price": round(exit_price, 4),

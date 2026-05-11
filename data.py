@@ -1,34 +1,34 @@
-import time
-import ccxt
 import pandas as pd
+from datetime import datetime, timedelta, timezone
+
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.requests import CryptoBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+import config
+
+_client = CryptoHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
 
 
-def fetch_ohlcv(symbol: str = "SOL/USDT", timeframe: str = "5m", days: int = 30) -> pd.DataFrame:
+def fetch_ohlcv(symbol: str = "SOL/USD", timeframe: str = "5m", days: int = 1) -> pd.DataFrame:
     """
-    Fetch OHLCV candles from Binance public API (no keys required).
-    Paginates automatically — 30 days of 5m candles = ~8,640 bars.
-    Note: Binance uses USDT pairs (SOL/USDT), not USD.
+    Fetch OHLCV candles from Alpaca crypto data API.
+    timeframe: '1m', '5m', '15m', '1h', '1d'
     """
-    exchange = ccxt.binance()
+    unit_map = {"m": TimeFrameUnit.Minute, "h": TimeFrameUnit.Hour, "d": TimeFrameUnit.Day}
+    amount = int("".join(c for c in timeframe if c.isdigit()))
+    unit = unit_map[timeframe[-1]]
 
-    # start timestamp in milliseconds
-    since = exchange.milliseconds() - days * 24 * 60 * 60 * 1000
-    now = exchange.milliseconds()
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
 
-    all_candles = []
-    while since < now:
-        candles = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=1000)
-        if not candles:
-            break
-        all_candles.extend(candles)
-        # advance past the last fetched candle
-        since = candles[-1][0] + 1
-        if len(candles) < 1000:
-            break
-        time.sleep(0.1)  # stay well under Binance rate limit
-
-    df = pd.DataFrame(all_candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.set_index("timestamp")
-    df = df[~df.index.duplicated(keep="first")]
-    return df.sort_index()
+    req = CryptoBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame(amount, unit),
+        start=start,
+        end=end,
+    )
+    bars = _client.get_crypto_bars(req).df
+    if isinstance(bars.index, pd.MultiIndex):
+        bars = bars.xs(symbol, level="symbol")
+    return bars.sort_index()

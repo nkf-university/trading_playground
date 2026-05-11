@@ -5,7 +5,7 @@ import pandas as pd
 from data import fetch_ohlcv
 from strategy import compute_indicators, get_signal, should_exit
 
-SYMBOL = "SOL/USDT"
+SYMBOL = "SOL/USD"
 TIMEFRAME = "5m"
 DAYS = 30
 TRADES_FILE = "trades.csv"
