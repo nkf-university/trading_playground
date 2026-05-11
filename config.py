@@ -8,4 +8,5 @@ SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
 if not API_KEY or not SECRET_KEY:
-    raise EnvironmentError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env")
+    available = [k for k in os.environ if "ALPACA" in k]
+    raise EnvironmentError(f"ALPACA_API_KEY and ALPACA_SECRET_KEY must be set. Found ALPACA vars: {available}")
