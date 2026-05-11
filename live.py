@@ -2,16 +2,17 @@
 Live paper trading loop — Bollinger Band Fade strategy → Alpaca paper account.
 
 Run:   python live.py
-Stop:  Ctrl+C  (open position persists on Alpaca; state file tracks entry metadata)
+Stop:  Ctrl+C
 
-Signal source : Binance 5m candles via ccxt (public API)
-Execution     : Alpaca paper trading account (real paper orders)
+Trades all 8 pairs independently. Each pair has its own position on Alpaca.
+Signal source : Alpaca crypto data (5m candles)
+Execution     : Alpaca paper trading (real paper orders)
 
 Note: Alpaca does not support crypto short selling.
-  - LONG signal  → BUY on Alpaca
-  - SHORT signal, no position → logged but skipped
-  - SHORT signal, have position → treated as exit (SELL)
-  - Middle-band exit → SELL full position
+  - LONG signal             → BUY on Alpaca
+  - SHORT signal, no pos    → skipped
+  - SHORT signal, have pos  → treated as exit (SELL)
+  - Middle-band cross       → SELL full position
 """
 
 import csv
@@ -31,11 +32,10 @@ from data import fetch_ohlcv
 from strategy import compute_indicators, get_signal, should_exit
 
 # ── config ─────────────────────────────────────────────────────────────
-SYMBOL        = "SOL/USD"    # used for both data and execution (Alpaca)
-ALPACA_SYMBOL = "SOL/USD"
+PAIRS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD", "LINK/USD", "AAVE/USD", "DOT/USD"]
 TIMEFRAME      = "5m"
 CANDLE_MINUTES = 5
-ORDER_SIZE_USD = 10.0          # notional dollars per trade
+ORDER_SIZE_USD = 10.0
 TRADES_FILE    = "trades.csv"
 STATE_FILE     = ".live_state.json"
 # ───────────────────────────────────────────────────────────────────────
@@ -45,18 +45,22 @@ trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=True)
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────
 
-def get_alpaca_qty() -> float:
-    """Return current SOL position qty on Alpaca (0.0 if none)."""
+def alpaca_symbol(pair: str) -> str:
+    """SOL/USD → SOLUSD (used for position lookups)."""
+    return pair.replace("/", "")
+
+
+def get_qty(pair: str) -> float:
     try:
-        pos = trading_client.get_open_position("SOLUSD")
+        pos = trading_client.get_open_position(alpaca_symbol(pair))
         return float(pos.qty)
     except Exception:
         return 0.0
 
 
-def alpaca_buy():
+def place_buy(pair: str):
     order = MarketOrderRequest(
-        symbol=ALPACA_SYMBOL,
+        symbol=pair,
         notional=ORDER_SIZE_USD,
         side=OrderSide.BUY,
         time_in_force=TimeInForce.GTC,
@@ -64,9 +68,9 @@ def alpaca_buy():
     return trading_client.submit_order(order)
 
 
-def alpaca_sell(qty: float):
+def place_sell(pair: str, qty: float):
     order = MarketOrderRequest(
-        symbol=ALPACA_SYMBOL,
+        symbol=pair,
         qty=qty,
         side=OrderSide.SELL,
         time_in_force=TimeInForce.GTC,
@@ -74,23 +78,19 @@ def alpaca_sell(qty: float):
     return trading_client.submit_order(order)
 
 
-# ── state persistence (entry metadata only — Alpaca owns position truth) ──
+# ── state (entry metadata per pair) ───────────────────────────────────
 
 def load_state() -> dict:
+    """Returns dict keyed by pair, e.g. {'SOL/USD': {entry_price, entry_time}}"""
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {"entry_price": None, "entry_time": None, "side": None}
+    return {}
 
 
 def save_state(state: dict):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
-
-
-def clear_state():
-    if os.path.exists(STATE_FILE):
-        os.remove(STATE_FILE)
 
 
 # ── trade logging ──────────────────────────────────────────────────────
@@ -110,11 +110,97 @@ def log_trade(trade: dict):
 def seconds_until_next_candle(candle_minutes: int) -> float:
     now = datetime.now(timezone.utc)
     seconds_past = (now.minute % candle_minutes) * 60 + now.second
-    return candle_minutes * 60 - seconds_past + 5  # +5s buffer after close
+    return candle_minutes * 60 - seconds_past + 5
 
 
 def now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+# ── per-pair tick ──────────────────────────────────────────────────────
+
+def process_pair(pair: str, state: dict) -> dict:
+    try:
+        df = fetch_ohlcv(pair, TIMEFRAME, days=1)
+        df = compute_indicators(df)
+    except Exception as e:
+        print(f"  [{pair}] ERROR fetching data: {e}")
+        return state
+
+    if len(df) < 3:
+        return state
+
+    row = df.iloc[-2]       # last closed candle
+    prev_row = df.iloc[-3]
+    candle_time = row.name.strftime("%H:%M UTC")
+
+    qty = get_qty(pair)
+    in_position = qty > 0
+    pair_state = state.get(pair)
+
+    # ── exit ──────────────────────────────────────────────────────────
+    if in_position and pair_state:
+        sig = get_signal(row, prev_row)
+        exit_triggered = should_exit(row, "long") or sig == "short"
+
+        if exit_triggered:
+            try:
+                place_sell(pair, qty)
+                entry_price = pair_state["entry_price"]
+                entry_time = datetime.fromisoformat(pair_state["entry_time"])
+                exit_price = row["close"]
+                hold_minutes = (row.name.to_pydatetime() - entry_time).total_seconds() / 60
+                pnl_pct = (exit_price - entry_price) / entry_price * 100
+                reason = "mid-band" if should_exit(row, "long") else "short signal"
+
+                log_trade({
+                    "timestamp": pair_state["entry_time"],
+                    "ticker": pair,
+                    "side": "long",
+                    "entry_price": round(entry_price, 6),
+                    "exit_price": round(exit_price, 6),
+                    "pnl_pct": round(pnl_pct, 4),
+                    "hold_time_minutes": round(hold_minutes, 1),
+                })
+                print(f"  [{pair}] EXIT  entry={entry_price:.4f}  exit={exit_price:.4f}  "
+                      f"pnl={pnl_pct:+.3f}%  hold={hold_minutes:.0f}m  reason={reason}  [{candle_time}]")
+                state.pop(pair, None)
+            except Exception as e:
+                print(f"  [{pair}] ERROR placing sell: {e}")
+            return state
+
+    # ── entry ─────────────────────────────────────────────────────────
+    if not in_position:
+        sig = get_signal(row, prev_row)
+
+        if sig == "long":
+            try:
+                place_buy(pair)
+                state[pair] = {
+                    "entry_price": row["close"],
+                    "entry_time": row.name.isoformat(),
+                }
+                print(f"  [{pair}] ENTRY LONG  @ {row['close']:.4f}  "
+                      f"rsi={row['rsi']:.1f}  vol={row['volume']/row['vol_ma']:.2f}x  "
+                      f"[{candle_time}]  → order placed ✓")
+            except Exception as e:
+                print(f"  [{pair}] ERROR placing buy: {e}")
+
+        elif sig == "short":
+            print(f"  [{pair}] SHORT skipped  rsi={row['rsi']:.1f}  [{candle_time}]")
+
+        else:
+            unrealised_str = ""
+            if in_position and pair_state:
+                unr = (row["close"] - pair_state["entry_price"]) / pair_state["entry_price"] * 100
+                unrealised_str = f"  unrealised={unr:+.3f}%"
+            print(f"  [{pair}] HOLD  rsi={row['rsi']:.1f}  close={row['close']:.4f}{unrealised_str}  [{candle_time}]")
+    else:
+        unr = (row["close"] - pair_state["entry_price"]) / pair_state["entry_price"] * 100 if pair_state else 0
+        print(f"  [{pair}] IN POSITION  qty={qty:.6f}  entry={pair_state['entry_price']:.4f}  "
+              f"current={row['close']:.4f}  unrealised={unr:+.3f}%  mid={row['bb_middle']:.4f}  [{candle_time}]")
+
+    return state
 
 
 # ── main loop ──────────────────────────────────────────────────────────
@@ -122,28 +208,30 @@ def now_str() -> str:
 def run():
     state = load_state()
 
-    # reconcile state file against actual Alpaca position on startup
-    alpaca_qty = get_alpaca_qty()
-    if alpaca_qty == 0 and state["entry_price"]:
-        print("[RESUME] State file exists but no Alpaca position found — clearing stale state.")
-        clear_state()
-        state = {"entry_price": None, "entry_time": None, "side": None}
-    elif alpaca_qty > 0 and state["entry_price"]:
-        print(f"[RESUME] Open LONG {alpaca_qty} SOL @ {state['entry_price']} entered {state['entry_time']}")
-    elif alpaca_qty > 0 and not state["entry_price"]:
-        print(f"[RESUME] Alpaca shows open position but no local state — entry metadata unavailable.")
-
     account = trading_client.get_account()
-    print(f"[INFO]  Strategy : Bollinger Band Fade  |  {SYMBOL}  |  {TIMEFRAME}")
+    print(f"[INFO]  Strategy : Bollinger Band Fade  |  {len(PAIRS)} pairs  |  {TIMEFRAME} candles")
+    print(f"[INFO]  Pairs    : {', '.join(PAIRS)}")
     print(f"[INFO]  Alpaca paper account — buying power: ${float(account.buying_power):,.2f}")
-    print(f"[INFO]  Order size: ${ORDER_SIZE_USD} notional per trade")
+    print(f"[INFO]  Order size: ${ORDER_SIZE_USD} notional per trade  |  max exposure: ${ORDER_SIZE_USD * len(PAIRS):.0f}")
     print(f"[INFO]  Trades logged to {TRADES_FILE}")
     print(f"[INFO]  Press Ctrl+C to stop\n")
 
+    # reconcile state against actual Alpaca positions on startup
+    for pair in PAIRS:
+        qty = get_qty(pair)
+        if qty > 0 and pair not in state:
+            print(f"[RESUME] {pair} has open position ({qty}) but no local state — entry metadata unavailable")
+        elif qty == 0 and pair in state:
+            print(f"[RESUME] {pair} state file exists but no Alpaca position — clearing stale state")
+            state.pop(pair)
+        elif qty > 0 and pair in state:
+            print(f"[RESUME] {pair} open LONG {qty} @ {state[pair]['entry_price']} entered {state[pair]['entry_time']}")
+
     def on_exit(sig, frame):
-        qty = get_alpaca_qty()
-        if qty > 0:
-            print(f"\n[STOP] Open position of {qty} SOL remains on Alpaca paper account.")
+        save_state(state)
+        open_pairs = [p for p in PAIRS if get_qty(p) > 0]
+        if open_pairs:
+            print(f"\n[STOP] Open positions remain on Alpaca: {', '.join(open_pairs)}")
         print("[STOP] Shutting down.")
         sys.exit(0)
 
@@ -152,96 +240,14 @@ def run():
     while True:
         wait = seconds_until_next_candle(CANDLE_MINUTES)
         next_time = datetime.now(timezone.utc) + timedelta(seconds=wait)
-        print(f"[{now_str()}] Sleeping {wait:.0f}s → next check at {next_time.strftime('%H:%M:%S UTC')}")
+        print(f"\n[{now_str()}] Sleeping {wait:.0f}s → next check at {next_time.strftime('%H:%M:%S UTC')}")
         time.sleep(wait)
+        print(f"[{now_str()}] Checking {len(PAIRS)} pairs...")
 
-        # ── fetch + compute ────────────────────────────────────────────
-        try:
-            df = fetch_ohlcv(SYMBOL, TIMEFRAME, days=1)
-            df = compute_indicators(df)
-        except Exception as e:
-            print(f"[{now_str()}] ERROR fetching data: {e} — skipping tick")
-            continue
+        for pair in PAIRS:
+            state = process_pair(pair, state)
 
-        if len(df) < 3:
-            print(f"[{now_str()}] Not enough candles, skipping.")
-            continue
-
-        # last fully closed candle (second-to-last; last is still forming)
-        row = df.iloc[-2]
-        prev_row = df.iloc[-3]
-        candle_time = row.name.strftime("%H:%M UTC")
-
-        # check actual Alpaca position as source of truth
-        alpaca_qty = get_alpaca_qty()
-        in_position = alpaca_qty > 0
-
-        # ── exit check ─────────────────────────────────────────────────
-        if in_position and state["entry_price"]:
-            # exit on middle band OR if a short signal fires while long
-            sig = get_signal(row, prev_row)
-            exit_triggered = should_exit(row, "long") or sig == "short"
-
-            if exit_triggered:
-                try:
-                    alpaca_sell(alpaca_qty)
-                    exit_price = row["close"]
-                    entry_price = state["entry_price"]
-                    entry_time = datetime.fromisoformat(state["entry_time"])
-                    hold_minutes = (row.name.to_pydatetime() - entry_time).total_seconds() / 60
-                    pnl_pct = (exit_price - entry_price) / entry_price * 100
-
-                    trade = {
-                        "timestamp": state["entry_time"],
-                        "ticker": SYMBOL,
-                        "side": "long",
-                        "entry_price": round(entry_price, 4),
-                        "exit_price": round(exit_price, 4),
-                        "pnl_pct": round(pnl_pct, 4),
-                        "hold_time_minutes": round(hold_minutes, 1),
-                    }
-                    log_trade(trade)
-                    reason = "middle band" if should_exit(row, "long") else "short signal"
-                    print(f"[{now_str()}] EXIT  LONG   entry={entry_price:.4f}  exit={exit_price:.4f}  "
-                          f"pnl={pnl_pct:+.3f}%  hold={hold_minutes:.0f}m  reason={reason}  [{candle_time}]")
-                    clear_state()
-                    state = {"entry_price": None, "entry_time": None, "side": None}
-                except Exception as e:
-                    print(f"[{now_str()}] ERROR placing sell order: {e}")
-                continue
-
-        # ── entry check ────────────────────────────────────────────────
-        if not in_position:
-            sig = get_signal(row, prev_row)
-
-            if sig == "long":
-                try:
-                    alpaca_buy()
-                    state = {
-                        "entry_price": row["close"],
-                        "entry_time": row.name.isoformat(),
-                        "side": "long",
-                    }
-                    save_state(state)
-                    print(f"[{now_str()}] ENTRY LONG   @ {row['close']:.4f}  "
-                          f"rsi={row['rsi']:.1f}  vol_ratio={row['volume']/row['vol_ma']:.2f}x  "
-                          f"[{candle_time}]  → Alpaca order placed ✓")
-                except Exception as e:
-                    print(f"[{now_str()}] ERROR placing buy order: {e}")
-
-            elif sig == "short":
-                print(f"[{now_str()}] SHORT signal @ {row['close']:.4f}  rsi={row['rsi']:.1f}  "
-                      f"[{candle_time}]  → skipped (Alpaca crypto no shorting)")
-
-            else:
-                print(f"[{now_str()}] HOLD   rsi={row['rsi']:.1f}  "
-                      f"close={row['close']:.4f}  bb_mid={row['bb_middle']:.4f}  [{candle_time}]")
-
-        else:
-            unrealised = (row["close"] - state["entry_price"]) / state["entry_price"] * 100 if state["entry_price"] else 0
-            print(f"[{now_str()}] IN POSITION  qty={alpaca_qty:.6f} SOL  "
-                  f"entry={state['entry_price']:.4f}  current={row['close']:.4f}  "
-                  f"unrealised={unrealised:+.3f}%  mid={row['bb_middle']:.4f}  [{candle_time}]")
+        save_state(state)
 
 
 if __name__ == "__main__":
