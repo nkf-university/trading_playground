@@ -1,18 +1,12 @@
 """
-Live paper trading loop — Bollinger Band Fade strategy → Alpaca paper account.
+Live paper trading — Strategy 4: RSI Reversion with 1d trend filter.
+
+Entry : RSI(14) on 1h crosses below 30 AND daily EMA20 > EMA50
+Exit  : RSI(14) crosses above 70
+Pairs : BTC/USD and ETH/USD only (validated in backtest)
 
 Run:   python live.py
 Stop:  Ctrl+C
-
-Trades all 8 pairs independently. Each pair has its own position on Alpaca.
-Signal source : Alpaca crypto data (5m candles)
-Execution     : Alpaca paper trading (real paper orders)
-
-Note: Alpaca does not support crypto short selling.
-  - LONG signal             → BUY on Alpaca
-  - SHORT signal, no pos    → skipped
-  - SHORT signal, have pos  → treated as exit (SELL)
-  - Middle-band cross       → SELL full position
 """
 
 import csv
@@ -28,13 +22,14 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 import config
-from data import fetch_ohlcv
+from data     import fetch_ohlcv
 from strategy import compute_indicators, get_signal, should_exit
 
 # ── config ─────────────────────────────────────────────────────────────
-PAIRS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD", "LINK/USD", "AAVE/USD", "DOT/USD"]
-TIMEFRAME      = "5m"
-CANDLE_MINUTES = 5
+PAIRS          = ["BTC/USD", "ETH/USD"]
+TIMEFRAME_1H   = "1h"
+TIMEFRAME_1D   = "1d"
+CANDLE_MINUTES = 60          # strategy runs on 1h candles
 ORDER_SIZE_USD = 10.0
 TRADES_FILE    = "trades.csv"
 STATE_FILE     = ".live_state.json"
@@ -46,7 +41,6 @@ trading_client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=True)
 # ── Alpaca helpers ─────────────────────────────────────────────────────
 
 def alpaca_symbol(pair: str) -> str:
-    """SOL/USD → SOLUSD (used for position lookups)."""
     return pair.replace("/", "")
 
 
@@ -59,29 +53,22 @@ def get_qty(pair: str) -> float:
 
 
 def place_buy(pair: str):
-    order = MarketOrderRequest(
-        symbol=pair,
-        notional=ORDER_SIZE_USD,
-        side=OrderSide.BUY,
-        time_in_force=TimeInForce.GTC,
-    )
-    return trading_client.submit_order(order)
+    return trading_client.submit_order(MarketOrderRequest(
+        symbol=pair, notional=ORDER_SIZE_USD,
+        side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
+    ))
 
 
 def place_sell(pair: str, qty: float):
-    order = MarketOrderRequest(
-        symbol=pair,
-        qty=qty,
-        side=OrderSide.SELL,
-        time_in_force=TimeInForce.GTC,
-    )
-    return trading_client.submit_order(order)
+    return trading_client.submit_order(MarketOrderRequest(
+        symbol=pair, qty=qty,
+        side=OrderSide.SELL, time_in_force=TimeInForce.GTC,
+    ))
 
 
-# ── state (entry metadata per pair) ───────────────────────────────────
+# ── state ──────────────────────────────────────────────────────────────
 
 def load_state() -> dict:
-    """Returns dict keyed by pair, e.g. {'SOL/USD': {entry_price, entry_time}}"""
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
@@ -96,7 +83,8 @@ def save_state(state: dict):
 # ── trade logging ──────────────────────────────────────────────────────
 
 def log_trade(trade: dict):
-    fieldnames = ["timestamp", "ticker", "side", "entry_price", "exit_price", "pnl_pct", "hold_time_minutes"]
+    fieldnames = ["timestamp", "ticker", "side", "entry_price",
+                  "exit_price", "pnl_pct", "hold_time_minutes"]
     write_header = not os.path.exists(TRADES_FILE)
     with open(TRADES_FILE, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -110,7 +98,7 @@ def log_trade(trade: dict):
 def seconds_until_next_candle(candle_minutes: int) -> float:
     now = datetime.now(timezone.utc)
     seconds_past = (now.minute % candle_minutes) * 60 + now.second
-    return candle_minutes * 60 - seconds_past + 5
+    return candle_minutes * 60 - seconds_past + 10   # +10s buffer
 
 
 def now_str() -> str:
@@ -121,84 +109,78 @@ def now_str() -> str:
 
 def process_pair(pair: str, state: dict) -> dict:
     try:
-        df = fetch_ohlcv(pair, TIMEFRAME, days=1)
-        df = compute_indicators(df)
+        df_1h = fetch_ohlcv(pair, TIMEFRAME_1H, days=5)    # ~120 bars — enough for RSI warmup
+        df_1d = fetch_ohlcv(pair, TIMEFRAME_1D, days=120)  # 120 days — enough for EMA50
+        df_1h, df_1d = compute_indicators(df_1h, df_1d)
     except Exception as e:
         print(f"  [{pair}] ERROR fetching data: {e}")
         return state
 
-    if len(df) < 3:
+    if len(df_1h) < 3 or len(df_1d) < 2:
         return state
 
-    row = df.iloc[-2]       # last closed candle
-    prev_row = df.iloc[-3]
-    candle_time = row.name.strftime("%H:%M UTC")
+    # use last two CLOSED 1h candles (avoid partially-formed candle)
+    row      = df_1h.iloc[-2]
+    prev_row = df_1h.iloc[-3]
+    candle_time = row.name.strftime("%Y-%m-%d %H:%M UTC")
 
-    qty = get_qty(pair)
-    in_position = qty > 0
-    pair_state = state.get(pair)
+    # daily trend: use last closed daily candle
+    daily_uptrend = bool(df_1d.iloc[-2]["uptrend"])
+
+    qty          = get_qty(pair)
+    in_position  = qty > 0
+    pair_state   = state.get(pair)
 
     # ── exit ──────────────────────────────────────────────────────────
     if in_position and pair_state:
-        sig = get_signal(row, prev_row)
-        exit_triggered = should_exit(row, "long") or sig == "short"
-
-        if exit_triggered:
+        if should_exit(row):
             try:
                 place_sell(pair, qty)
-                entry_price = pair_state["entry_price"]
-                entry_time = datetime.fromisoformat(pair_state["entry_time"])
-                exit_price = row["close"]
+                entry_price  = pair_state["entry_price"]
+                entry_time   = datetime.fromisoformat(pair_state["entry_time"])
+                exit_price   = row["close"]
                 hold_minutes = (row.name.to_pydatetime() - entry_time).total_seconds() / 60
-                pnl_pct = (exit_price - entry_price) / entry_price * 100
-                reason = "mid-band" if should_exit(row, "long") else "short signal"
+                pnl_pct      = (exit_price - entry_price) / entry_price * 100
 
                 log_trade({
-                    "timestamp": pair_state["entry_time"],
-                    "ticker": pair,
-                    "side": "long",
-                    "entry_price": round(entry_price, 6),
-                    "exit_price": round(exit_price, 6),
-                    "pnl_pct": round(pnl_pct, 4),
+                    "timestamp":         pair_state["entry_time"],
+                    "ticker":            pair,
+                    "side":              "long",
+                    "entry_price":       round(entry_price, 6),
+                    "exit_price":        round(exit_price, 6),
+                    "pnl_pct":           round(pnl_pct, 4),
                     "hold_time_minutes": round(hold_minutes, 1),
                 })
-                print(f"  [{pair}] EXIT  entry={entry_price:.4f}  exit={exit_price:.4f}  "
-                      f"pnl={pnl_pct:+.3f}%  hold={hold_minutes:.0f}m  reason={reason}  [{candle_time}]")
+                print(f"  [{pair}] EXIT   rsi={row['rsi']:.1f}  "
+                      f"entry={entry_price:.4f}  exit={exit_price:.4f}  "
+                      f"pnl={pnl_pct:+.3f}%  hold={hold_minutes:.0f}m  [{candle_time}]")
                 state.pop(pair, None)
             except Exception as e:
                 print(f"  [{pair}] ERROR placing sell: {e}")
-            return state
+        else:
+            unr = (row["close"] - pair_state["entry_price"]) / pair_state["entry_price"] * 100
+            print(f"  [{pair}] IN POSITION  rsi={row['rsi']:.1f}  "
+                  f"entry={pair_state['entry_price']:.4f}  current={row['close']:.4f}  "
+                  f"unrealised={unr:+.3f}%  trend={'↑' if daily_uptrend else '↓'}  [{candle_time}]")
+        return state
 
     # ── entry ─────────────────────────────────────────────────────────
-    if not in_position:
-        sig = get_signal(row, prev_row)
-
-        if sig == "long":
-            try:
-                place_buy(pair)
-                state[pair] = {
-                    "entry_price": row["close"],
-                    "entry_time": row.name.isoformat(),
-                }
-                print(f"  [{pair}] ENTRY LONG  @ {row['close']:.4f}  "
-                      f"rsi={row['rsi']:.1f}  vol={row['volume']/row['vol_ma']:.2f}x  "
-                      f"[{candle_time}]  → order placed ✓")
-            except Exception as e:
-                print(f"  [{pair}] ERROR placing buy: {e}")
-
-        elif sig == "short":
-            print(f"  [{pair}] SHORT skipped  rsi={row['rsi']:.1f}  [{candle_time}]")
-
-        else:
-            unrealised_str = ""
-            if in_position and pair_state:
-                unr = (row["close"] - pair_state["entry_price"]) / pair_state["entry_price"] * 100
-                unrealised_str = f"  unrealised={unr:+.3f}%"
-            print(f"  [{pair}] HOLD  rsi={row['rsi']:.1f}  close={row['close']:.4f}{unrealised_str}  [{candle_time}]")
+    sig = get_signal(row, prev_row, daily_uptrend)
+    if sig == "long":
+        try:
+            place_buy(pair)
+            state[pair] = {
+                "entry_price": row["close"],
+                "entry_time":  row.name.isoformat(),
+            }
+            print(f"  [{pair}] ENTRY  rsi={row['rsi']:.1f}  @ {row['close']:.4f}  "
+                  f"trend={'↑' if daily_uptrend else '↓'}  [{candle_time}]  → order placed ✓")
+        except Exception as e:
+            print(f"  [{pair}] ERROR placing buy: {e}")
     else:
-        unr = (row["close"] - pair_state["entry_price"]) / pair_state["entry_price"] * 100 if pair_state else 0
-        print(f"  [{pair}] IN POSITION  qty={qty:.6f}  entry={pair_state['entry_price']:.4f}  "
-              f"current={row['close']:.4f}  unrealised={unr:+.3f}%  mid={row['bb_middle']:.4f}  [{candle_time}]")
+        trend_str = "↑ uptrend" if daily_uptrend else "↓ downtrend (filter active)"
+        print(f"  [{pair}] HOLD   rsi={row['rsi']:.1f}  close={row['close']:.4f}  "
+              f"{trend_str}  [{candle_time}]")
 
     return state
 
@@ -209,29 +191,28 @@ def run():
     state = load_state()
 
     account = trading_client.get_account()
-    print(f"[INFO]  Strategy : Bollinger Band Fade  |  {len(PAIRS)} pairs  |  {TIMEFRAME} candles")
+    print(f"[INFO]  Strategy : S4 RSI Reversion + 1d trend filter")
     print(f"[INFO]  Pairs    : {', '.join(PAIRS)}")
-    print(f"[INFO]  Alpaca paper account — buying power: ${float(account.buying_power):,.2f}")
-    print(f"[INFO]  Order size: ${ORDER_SIZE_USD} notional per trade  |  max exposure: ${ORDER_SIZE_USD * len(PAIRS):.0f}")
-    print(f"[INFO]  Trades logged to {TRADES_FILE}")
-    print(f"[INFO]  Press Ctrl+C to stop\n")
+    print(f"[INFO]  Signals  : RSI(14) < 30 entry  |  RSI > 70 exit  |  1d EMA20>50 filter")
+    print(f"[INFO]  Alpaca paper — buying power: ${float(account.buying_power):,.2f}")
+    print(f"[INFO]  Order size: ${ORDER_SIZE_USD} notional  |  checks every {CANDLE_MINUTES}min")
+    print(f"[INFO]  Trades logged to {TRADES_FILE}\n")
 
-    # reconcile state against actual Alpaca positions on startup
+    # reconcile state vs Alpaca on startup
     for pair in PAIRS:
         qty = get_qty(pair)
-        if qty > 0 and pair not in state:
-            print(f"[RESUME] {pair} has open position ({qty}) but no local state — entry metadata unavailable")
+        if qty > 0 and pair in state:
+            print(f"[RESUME] {pair} open LONG {qty} @ {state[pair]['entry_price']} "
+                  f"entered {state[pair]['entry_time']}")
         elif qty == 0 and pair in state:
-            print(f"[RESUME] {pair} state file exists but no Alpaca position — clearing stale state")
+            print(f"[RESUME] {pair} stale state cleared (no Alpaca position)")
             state.pop(pair)
-        elif qty > 0 and pair in state:
-            print(f"[RESUME] {pair} open LONG {qty} @ {state[pair]['entry_price']} entered {state[pair]['entry_time']}")
 
     def on_exit(sig, frame):
         save_state(state)
         open_pairs = [p for p in PAIRS if get_qty(p) > 0]
         if open_pairs:
-            print(f"\n[STOP] Open positions remain on Alpaca: {', '.join(open_pairs)}")
+            print(f"\n[STOP] Open positions on Alpaca: {', '.join(open_pairs)}")
         print("[STOP] Shutting down.")
         sys.exit(0)
 
@@ -240,13 +221,13 @@ def run():
     while True:
         wait = seconds_until_next_candle(CANDLE_MINUTES)
         next_time = datetime.now(timezone.utc) + timedelta(seconds=wait)
-        print(f"\n[{now_str()}] Sleeping {wait:.0f}s → next check at {next_time.strftime('%H:%M:%S UTC')}")
+        print(f"\n[{now_str()}] Sleeping {wait:.0f}s → next check at "
+              f"{next_time.strftime('%H:%M:%S UTC')}")
         time.sleep(wait)
-        print(f"[{now_str()}] Checking {len(PAIRS)} pairs...")
 
+        print(f"[{now_str()}] Checking {len(PAIRS)} pairs (S4 RSI)...")
         for pair in PAIRS:
             state = process_pair(pair, state)
-
         save_state(state)
 
 
